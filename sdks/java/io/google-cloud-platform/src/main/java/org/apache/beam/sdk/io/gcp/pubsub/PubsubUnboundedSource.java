@@ -21,9 +21,21 @@ import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Pr
 import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
 import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkState;
 
+import com.google.api.client.http.GenericUrl;
+import com.google.api.client.http.HttpRequest;
+import com.google.api.client.http.HttpRequestFactory;
+import com.google.api.client.http.HttpResponse;
 import com.google.api.client.util.Clock;
+import com.google.auth.Credentials;
+import com.google.auth.http.HttpCredentialsAdapter;
+import com.google.cloud.pubsub.v1.AckReplyConsumer;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
@@ -37,6 +49,8 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Queue;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -48,6 +62,7 @@ import org.apache.beam.sdk.coders.ListCoder;
 import org.apache.beam.sdk.coders.NullableCoder;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.extensions.gcp.options.GcpOptions;
+import org.apache.beam.sdk.extensions.gcp.util.Transport;
 import org.apache.beam.sdk.io.Read;
 import org.apache.beam.sdk.io.UnboundedSource;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubClient.ProjectPath;
@@ -55,6 +70,9 @@ import org.apache.beam.sdk.io.gcp.pubsub.PubsubClient.PubsubClientFactory;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubClient.SubscriptionPath;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubClient.TopicPath;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubMessages.DeserializeBytesIntoPubsubMessagePayloadOnly;
+import org.apache.beam.sdk.io.gcp.pubsub.PubsubStreamingPull.ReceivedMessage;
+import org.apache.beam.sdk.io.gcp.pubsub.PubsubStreamingPull.StreamingPullSubscriber;
+import org.apache.beam.sdk.io.gcp.pubsub.PubsubStreamingPull.StreamingPullSubscriberFactory;
 import org.apache.beam.sdk.metrics.Counter;
 import org.apache.beam.sdk.metrics.SourceMetrics;
 import org.apache.beam.sdk.options.ExperimentalOptions;
@@ -171,8 +189,14 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
    */
   private static final int MIN_WATERMARK_SPREAD = 2;
 
-  /** Additional sharding so that we can hide read message latency. */
+  /**
+   * Additional sharding so that we can hide read message latency. Not applied when StreamingPull is
+   * enabled, since StreamingPull reads never block the reader thread.
+   */
   private static final int SCALE_OUT = 4;
+
+  /** How long {@link PubsubReader#close()} waits for a StreamingPull subscriber to terminate. */
+  private static final long STREAMING_PULL_STOP_TIMEOUT_MS = 30_000L;
 
   // TODO: Would prefer to use MinLongFn but it is a BinaryCombineFn<Long> rather
   // than a BinaryCombineLongFn. [BEAM-285]
@@ -367,6 +391,8 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
     /** For access to topic and checkpointCoder. */
     private final PubsubSource outer;
 
+    private final PubsubOptions options;
+
     @VisibleForTesting final SubscriptionPath subscription;
 
     /** Client on which to talk to Pubsub. Contains a null value if the client has been closed. */
@@ -512,6 +538,40 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
     /** Stats only: Maximum number of checkpoints in flight at any time. */
     private int maxInFlightCheckpoints;
 
+    // StreamingPull state. Only used when streamingPullEnabled.
+
+    /** Whether this reader receives messages over StreamingPull instead of unary pulls. */
+    private final boolean streamingPullEnabled;
+
+    /** The StreamingPull subscriber, or {@literal null} if not started (or not enabled). */
+    private @Nullable StreamingPullSubscriber streamingPullSubscriber;
+
+    /**
+     * Messages handed over by the StreamingPull subscriber's receiver, not yet moved into {@link
+     * #notYetRead}. CAUTION: Written by subscriber threads, drained by the reader thread.
+     */
+    private final Queue<ReceivedMessage> streamingPullReceived;
+
+    /**
+     * Live ack handles of StreamingPull messages, keyed by the synthetic ack id that the reader
+     * tracks in {@link #notYetRead}, {@link #safeToAckIds}, {@link #inFlight} and checkpoints.
+     * CAUTION: Accessed by the reader, checkpointing and subscriber threads.
+     */
+    private final Map<String, AckReplyConsumer> streamingPullConsumers;
+
+    /** Prefix for this reader's synthetic ack ids. */
+    private final String streamingPullAckIdPrefix;
+
+    /** Sequence number of the next synthetic ack id. */
+    private long streamingPullNextAckId;
+
+    /** Set once {@link #close()} starts; late messages from the subscriber are nacked. */
+    private final AtomicBoolean streamingPullClosed = new AtomicBoolean(false);
+
+    /** Fatal failure reported by the StreamingPull subscriber, rethrown by {@link #advance()}. */
+    private final AtomicReference<@Nullable Throwable> streamingPullFailure =
+        new AtomicReference<>();
+
     private static MovingFunction newFun(Combine.BinaryCombineLongFn function) {
       return new MovingFunction(
           SAMPLE_PERIOD.getMillis(),
@@ -525,6 +585,7 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
     public PubsubReader(PubsubOptions options, PubsubSource outer, SubscriptionPath subscription)
         throws IOException, GeneralSecurityException {
       this.outer = outer;
+      this.options = options;
       this.subscription = subscription;
       pubsubClient =
           new AtomicReference<>(
@@ -559,6 +620,12 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
       numLateMessages = newFun(SUM);
       numInFlightCheckpoints = new AtomicInteger();
       maxInFlightCheckpoints = 0;
+      streamingPullEnabled = options.getPubsubStreamingPullEnabled();
+      streamingPullReceived = new ConcurrentLinkedQueue<>();
+      streamingPullConsumers = new ConcurrentHashMap<>();
+      streamingPullAckIdPrefix =
+          PubsubStreamingPull.SYNTHETIC_ACK_ID_PREFIX + UUID.randomUUID() + ":";
+      streamingPullNextAckId = 0L;
     }
 
     @VisibleForTesting
@@ -575,7 +642,14 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
      * <p>CAUTION: Retains {@code ackIds}.
      */
     void ackBatch(List<String> ackIds) throws IOException {
-      pubsubClient.get().acknowledge(subscription, ackIds);
+      if (streamingPullEnabled) {
+        List<String> unaryAckIds = streamingPullReply(ackIds, true);
+        if (!unaryAckIds.isEmpty()) {
+          pubsubClient.get().acknowledge(subscription, unaryAckIds);
+        }
+      } else {
+        pubsubClient.get().acknowledge(subscription, ackIds);
+      }
       ackedIds.add(ackIds);
     }
 
@@ -584,8 +658,54 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
      * given {@code ockIds}. Does not retain {@code ackIds}.
      */
     public void nackBatch(long nowMsSinceEpoch, List<String> ackIds) throws IOException {
-      pubsubClient.get().modifyAckDeadline(subscription, ackIds, 0);
+      if (streamingPullEnabled) {
+        List<String> unaryAckIds = streamingPullReply(ackIds, false);
+        if (!unaryAckIds.isEmpty()) {
+          pubsubClient.get().modifyAckDeadline(subscription, unaryAckIds, 0);
+        }
+      } else {
+        pubsubClient.get().modifyAckDeadline(subscription, ackIds, 0);
+      }
       numNacked.add(nowMsSinceEpoch, ackIds.size());
+    }
+
+    /**
+     * Acks ({@code ack == true}) or nacks the StreamingPull messages with the given synthetic ack
+     * ids through their live {@link AckReplyConsumer}. Returns the ids that are real Pub/Sub ack
+     * ids (for example from a checkpoint written by a unary-pull reader), which the caller must
+     * handle with the unary client. Synthetic ids without a live consumer (already acked or nacked,
+     * or from a checkpoint of a previous run) are dropped: Pub/Sub redelivers those messages once
+     * their lease expires, which happens within {@link
+     * PubsubStreamingPull#MAX_DURATION_PER_ACK_EXTENSION} after their subscriber went away.
+     *
+     * <p>CAUTION: May be invoked from a separate thread.
+     */
+    private List<String> streamingPullReply(List<String> ackIds, boolean ack) {
+      List<String> unaryAckIds = new ArrayList<>();
+      int missing = 0;
+      for (String ackId : ackIds) {
+        AckReplyConsumer consumer = streamingPullConsumers.remove(ackId);
+        if (consumer != null) {
+          if (ack) {
+            consumer.ack();
+          } else {
+            consumer.nack();
+          }
+        } else if (PubsubStreamingPull.isSyntheticAckId(ackId)) {
+          missing++;
+        } else {
+          unaryAckIds.add(ackId);
+        }
+      }
+      if (missing > 0) {
+        LOG.debug(
+            "Pubsub {}: {} StreamingPull messages to {} had no live subscriber, relying on "
+                + "redelivery",
+            subscription,
+            missing,
+            ack ? "ACK" : "NACK");
+      }
+      return unaryAckIds;
     }
 
     /**
@@ -733,19 +853,83 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
 
       // Capture the received messages.
       for (PubsubClient.IncomingMessage incomingMessage : receivedMessages) {
-        notYetRead.add(incomingMessage);
-        notYetReadBytes += incomingMessage.message().getData().size();
-        inFlight.put(
-            incomingMessage.ackId(),
-            new InFlightState(requestTimeMsSinceEpoch, deadlineMsSinceEpoch));
-        numReceived++;
-        numReceivedRecently.add(requestTimeMsSinceEpoch, 1L);
-        minReceivedTimestampMsSinceEpoch.add(
-            requestTimeMsSinceEpoch, incomingMessage.timestampMsSinceEpoch());
-        maxReceivedTimestampMsSinceEpoch.add(
-            requestTimeMsSinceEpoch, incomingMessage.timestampMsSinceEpoch());
-        minUnreadTimestampMsSinceEpoch.add(
-            requestTimeMsSinceEpoch, incomingMessage.timestampMsSinceEpoch());
+        captureReceived(incomingMessage, requestTimeMsSinceEpoch, deadlineMsSinceEpoch);
+      }
+    }
+
+    /** Track a newly received message as not yet read and in flight. */
+    private void captureReceived(
+        PubsubClient.IncomingMessage incomingMessage,
+        long requestTimeMsSinceEpoch,
+        long deadlineMsSinceEpoch) {
+      notYetRead.add(incomingMessage);
+      notYetReadBytes += incomingMessage.message().getData().size();
+      inFlight.put(
+          incomingMessage.ackId(),
+          new InFlightState(requestTimeMsSinceEpoch, deadlineMsSinceEpoch));
+      numReceived++;
+      numReceivedRecently.add(requestTimeMsSinceEpoch, 1L);
+      minReceivedTimestampMsSinceEpoch.add(
+          requestTimeMsSinceEpoch, incomingMessage.timestampMsSinceEpoch());
+      maxReceivedTimestampMsSinceEpoch.add(
+          requestTimeMsSinceEpoch, incomingMessage.timestampMsSinceEpoch());
+      minUnreadTimestampMsSinceEpoch.add(
+          requestTimeMsSinceEpoch, incomingMessage.timestampMsSinceEpoch());
+    }
+
+    /**
+     * NON-BLOCKING Move whatever the StreamingPull subscriber has received so far into {@link
+     * #notYetRead}. Flow control and lease extension are handled by the subscriber.
+     */
+    private void drainStreamingPull() throws IOException {
+      Throwable failure = streamingPullFailure.get();
+      if (failure != null) {
+        throw new IOException(
+            "Pub/Sub StreamingPull subscriber for " + subscription.getPath() + " failed", failure);
+      }
+      ReceivedMessage received = streamingPullReceived.poll();
+      if (received == null) {
+        return;
+      }
+      long requestTimeMsSinceEpoch = now();
+      long deadlineMsSinceEpoch = requestTimeMsSinceEpoch + ackTimeoutMs;
+      lastReceivedMsSinceEpoch = requestTimeMsSinceEpoch;
+      do {
+        String ackId = streamingPullAckIdPrefix + (streamingPullNextAckId++);
+        PubsubClient.IncomingMessage incomingMessage;
+        try {
+          incomingMessage =
+              PubsubStreamingPull.toIncomingMessage(
+                  received.message,
+                  outer.outer.timestampAttribute,
+                  outer.outer.idAttribute,
+                  requestTimeMsSinceEpoch,
+                  ackId);
+        } catch (RuntimeException e) {
+          // Same as a unary pull: a bad message fails the reader. Let it be redelivered.
+          received.consumer.nack();
+          throw e;
+        }
+        streamingPullConsumers.put(ackId, received.consumer);
+        captureReceived(incomingMessage, requestTimeMsSinceEpoch, deadlineMsSinceEpoch);
+        received = streamingPullReceived.poll();
+      } while (received != null);
+    }
+
+    /** Receiver for the StreamingPull subscriber. Runs on subscriber threads. */
+    private void receiveStreamingPull(
+        com.google.pubsub.v1.PubsubMessage message, AckReplyConsumer consumer) {
+      if (streamingPullClosed.get()) {
+        consumer.nack();
+        return;
+      }
+      streamingPullReceived.add(new ReceivedMessage(message, consumer));
+      if (streamingPullClosed.get()) {
+        // Raced with close(): it may have already swept the queue.
+        ReceivedMessage leftover;
+        while ((leftover = streamingPullReceived.poll()) != null) {
+          leftover.consumer.nack();
+        }
       }
     }
 
@@ -829,6 +1013,19 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
     public boolean start() throws IOException {
       // Determine the ack timeout.
       ackTimeoutMs = pubsubClient.get().ackDeadlineSeconds(subscription) * 1000;
+      if (streamingPullEnabled) {
+        StreamingPullSubscriberFactory factory = outer.outer.streamingPullSubscriberFactory;
+        if (factory == null) {
+          factory = PubsubStreamingPull.DEFAULT_FACTORY;
+        }
+        streamingPullSubscriber =
+            factory.create(
+                subscription,
+                options,
+                this::receiveStreamingPull,
+                failure -> streamingPullFailure.compareAndSet(null, failure));
+        streamingPullSubscriber.start();
+      }
       return advance();
     }
 
@@ -851,18 +1048,25 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
       // Retire state associated with ACKed messages.
       retire();
 
-      // Extend all pressing deadlines.
-      // Will BLOCK until done.
-      // If the system is pulling messages only to let them sit in a downsteam queue then
-      // this will have the effect of slowing down the pull rate.
-      // However, if the system is genuinely taking longer to process each message then
-      // the work to extend ACKs would be better done in the background.
-      extend();
+      if (streamingPullEnabled) {
+        // The subscriber extends leases and applies flow control itself. Never blocks.
+        if (notYetRead.isEmpty()) {
+          drainStreamingPull();
+        }
+      } else {
+        // Extend all pressing deadlines.
+        // Will BLOCK until done.
+        // If the system is pulling messages only to let them sit in a downsteam queue then
+        // this will have the effect of slowing down the pull rate.
+        // However, if the system is genuinely taking longer to process each message then
+        // the work to extend ACKs would be better done in the background.
+        extend();
 
-      if (notYetRead.isEmpty()) {
-        // Pull another batch.
-        // Will BLOCK until fetch returns, but will not block until a message is available.
-        pull();
+        if (notYetRead.isEmpty()) {
+          // Pull another batch.
+          // Will BLOCK until fetch returns, but will not block until a message is available.
+          pull();
+        }
       }
 
       // Take one message from queue.
@@ -924,8 +1128,45 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
      */
     @Override
     public void close() throws IOException {
+      if (streamingPullEnabled) {
+        closeStreamingPull();
+      }
       active.set(false);
       maybeCloseClient();
+    }
+
+    /**
+     * Nack every StreamingPull message not yet acked (unread, read but not checkpointed, and in
+     * checkpoints that were not finalized) so Pub/Sub redelivers them promptly, then stop the
+     * subscriber with a bounded wait. Acks of checkpoints finalized after this are no-ops.
+     */
+    private void closeStreamingPull() {
+      if (!streamingPullClosed.compareAndSet(false, true)) {
+        return;
+      }
+      int nacked = 0;
+      ReceivedMessage received;
+      while ((received = streamingPullReceived.poll()) != null) {
+        received.consumer.nack();
+        nacked++;
+      }
+      for (String ackId : new ArrayList<>(streamingPullConsumers.keySet())) {
+        AckReplyConsumer consumer = streamingPullConsumers.remove(ackId);
+        if (consumer != null) {
+          consumer.nack();
+          nacked++;
+        }
+      }
+      numNacked.add(now(), nacked);
+      StreamingPullSubscriber subscriber = streamingPullSubscriber;
+      streamingPullSubscriber = null;
+      if (subscriber != null) {
+        LOG.info(
+            "Pubsub {}: stopping StreamingPull subscriber, NACKed {} unacked messages",
+            subscription,
+            nacked);
+        subscriber.stop(STREAMING_PULL_STOP_TIMEOUT_MS);
+      }
     }
 
     /**
@@ -1010,6 +1251,71 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
     public long getSplitBacklogBytes() {
       return notYetReadBytes;
     }
+
+    @Override
+    public long getTotalBacklogRecords() {
+      if (!options.getPubsubBacklogReportingEnabled()) {
+        return BACKLOG_UNKNOWN;
+      }
+      try {
+        Credentials credentials = options.getGcpCredential();
+        HttpRequestFactory requestFactory =
+            credentials == null
+                ? Transport.getTransport().createRequestFactory()
+                : Transport.getTransport()
+                    .createRequestFactory(new HttpCredentialsAdapter(credentials));
+        String projectId = subscription.getProjectId();
+        String subscriptionId = subscription.getName();
+        long nowMs = now();
+        GenericUrl url =
+            new GenericUrl(
+                String.format(
+                    "https://monitoring.googleapis.com/v3/projects/%s/timeSeries", projectId));
+        url.set(
+            "filter",
+            String.format(
+                "metric.type=\"pubsub.googleapis.com/subscription/num_undelivered_messages\""
+                    + " AND resource.type=\"pubsub_subscription\""
+                    + " AND resource.labels.subscription_id=\"%s\"",
+                subscriptionId));
+        url.set(
+            "interval.startTime",
+            new Instant(nowMs - Duration.standardMinutes(5).getMillis()).toString());
+        url.set("interval.endTime", new Instant(nowMs).toString());
+        HttpRequest request = requestFactory.buildGetRequest(url);
+        request.setConnectTimeout(10_000);
+        request.setReadTimeout(10_000);
+        HttpResponse response = request.execute();
+        try (InputStreamReader reader =
+            new InputStreamReader(response.getContent(), StandardCharsets.UTF_8)) {
+          JsonElement parsed = JsonParser.parseReader(reader);
+          if (!parsed.isJsonObject()) {
+            return BACKLOG_UNKNOWN;
+          }
+          JsonArray series = parsed.getAsJsonObject().getAsJsonArray("timeSeries");
+          if (series == null || series.isEmpty()) {
+            return BACKLOG_UNKNOWN;
+          }
+          JsonArray points = series.get(0).getAsJsonObject().getAsJsonArray("points");
+          if (points == null || points.isEmpty()) {
+            return BACKLOG_UNKNOWN;
+          }
+          JsonObject value = points.get(0).getAsJsonObject().getAsJsonObject("value");
+          if (value == null || !value.has("int64Value")) {
+            return BACKLOG_UNKNOWN;
+          }
+          return value.get("int64Value").getAsLong();
+        } finally {
+          response.disconnect();
+        }
+      } catch (Exception e) {
+        LOG.warn(
+            "Failed to query Pub/Sub num_undelivered_messages for {}: {}",
+            subscription.getPath(),
+            e.toString());
+        return BACKLOG_UNKNOWN;
+      }
+    }
   }
 
   // ================================================================================
@@ -1035,14 +1341,20 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
     @Override
     public List<PubsubSource> split(int desiredNumSplits, PipelineOptions options)
         throws Exception {
-      List<PubsubSource> result = new ArrayList<>(desiredNumSplits);
+      // With StreamingPull, reads don't block the reader thread, so there is no pull latency to
+      // hide with extra splits; each extra split would only add another subscriber and stream.
+      int numSplits =
+          options.as(PubsubOptions.class).getPubsubStreamingPullEnabled()
+              ? desiredNumSplits
+              : desiredNumSplits * SCALE_OUT;
+      List<PubsubSource> result = new ArrayList<>(numSplits);
       PubsubSource splitSource = this;
       if (subscriptionPath == null) {
         splitSource =
             new PubsubSource(
                 outer, StaticValueProvider.of(outer.createRandomSubscription(options)));
       }
-      for (int i = 0; i < desiredNumSplits * SCALE_OUT; i++) {
+      for (int i = 0; i < numSplits; i++) {
         // Since the source is immutable and Pubsub automatically shards we simply
         // replicate ourselves the requested number of times
         result.add(splitSource);
@@ -1160,6 +1472,12 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
 
   /** For testing only: Clock to use for all timekeeping. If {@literal null} use system clock. */
   private @Nullable Clock clock;
+
+  /**
+   * For testing only: creates StreamingPull subscribers. If {@literal null} use {@link
+   * PubsubStreamingPull#DEFAULT_FACTORY}.
+   */
+  private @Nullable StreamingPullSubscriberFactory streamingPullSubscriberFactory;
 
   /** Factory for creating underlying Pubsub transport. */
   private final PubsubClientFactory pubsubFactory;
@@ -1343,6 +1661,12 @@ public class PubsubUnboundedSource extends PTransform<PBegin, PCollection<Pubsub
 
   public boolean getNeedsOrderingKey() {
     return needsOrderingKey;
+  }
+
+  /** For testing only: replace how StreamingPull subscribers are created. */
+  @VisibleForTesting
+  void setStreamingPullSubscriberFactory(StreamingPullSubscriberFactory factory) {
+    this.streamingPullSubscriberFactory = factory;
   }
 
   @Override

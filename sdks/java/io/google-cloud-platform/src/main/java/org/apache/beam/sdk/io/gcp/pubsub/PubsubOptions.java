@@ -77,4 +77,52 @@ public interface PubsubOptions
   String getPubsubRootUrl();
 
   void setPubsubRootUrl(String value);
+
+  @Description(
+      "Whether PubsubUnboundedSource queries Cloud Monitoring for subscription "
+          + "num_undelivered_messages to report total backlog records. Requires "
+          + "monitoring.timeSeries.list permission on the subscription project.")
+  @Default.Boolean(false)
+  boolean getPubsubBacklogReportingEnabled();
+
+  void setPubsubBacklogReportingEnabled(boolean value);
+
+  @Description(
+      "Whether PubsubUnboundedSource reads with Pub/Sub StreamingPull (google-cloud-pubsub "
+          + "Subscriber) instead of unary pull calls. Messages are still acked only when the "
+          + "checkpoint covering them is finalized.")
+  @Default.Boolean(false)
+  boolean getPubsubStreamingPullEnabled();
+
+  void setPubsubStreamingPullEnabled(boolean value);
+
+  @Description(
+      "StreamingPull flow control: maximum number of received but not yet acked messages per "
+          + "reader, including messages waiting for checkpoint finalization.")
+  @Default.Long(20_000L)
+  long getPubsubStreamingPullMaxOutstandingMessages();
+
+  void setPubsubStreamingPullMaxOutstandingMessages(long value);
+
+  @Description(
+      "StreamingPull flow control: maximum bytes of received but not yet acked messages per "
+          + "reader, including messages waiting for checkpoint finalization.")
+  @Default.Long(64L * 1024 * 1024)
+  long getPubsubStreamingPullMaxOutstandingBytes();
+
+  void setPubsubStreamingPullMaxOutstandingBytes(long value);
+
+  @Description("Number of StreamingPull streams per reader.")
+  @Default.Integer(1)
+  int getPubsubStreamingPullParallelPullCount();
+
+  void setPubsubStreamingPullParallelPullCount(int value);
+
+  @Description(
+      "Maximum total time, in seconds, the StreamingPull subscriber extends a message's lease "
+          + "while it waits for the checkpoint covering it to be finalized.")
+  @Default.Integer(3600)
+  int getPubsubStreamingPullMaxAckExtensionPeriodSeconds();
+
+  void setPubsubStreamingPullMaxAckExtensionPeriodSeconds(int value);
 }
